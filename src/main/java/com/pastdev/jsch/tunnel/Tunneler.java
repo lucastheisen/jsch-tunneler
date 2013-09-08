@@ -10,12 +10,12 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.regex.Pattern;
 
 
 import org.slf4j.Logger;
@@ -31,28 +31,18 @@ import com.pastdev.jsch.proxy.SshProxy;
 
 
 public class Tunneler implements Closeable {
-    private static final File DEFAULT_DOT_SSH;
-    private static final File DEFAULT_HOME;
-    private static final String DEFAULT_HOSTNAME = "localhost";
-    private static final int DEFAULT_PORT = 22;
-    private static final String DEFAULT_USERNAME = System.getProperty( "user.name" ).toLowerCase();
-
+    private static final String PROPERTY_JSCH_TUNNELS_FILE = "jsch.tunnels.file";
+    private static final String PROPERTY_JSCH_DOT_JSCH = "jsch.dotJsch";
+    private static final Pattern PATTERN_TUNNELS_CFG_COMMENT_LINE = Pattern.compile( "^\\s*#.*$" );
     private static Logger logger = LoggerFactory.getLogger( Tunneler.class );
 
-    static {
-        DEFAULT_HOME = new File( System.getProperty( "user.home" ) );
-        DEFAULT_DOT_SSH = new File( DEFAULT_HOME, ".ssh" );
-    }
-
+    private File dotJschDir;
     private DefaultSessionFactory sessionFactory;
     private List<TunnelConnection> tunnelConnections;
 
     public Tunneler() throws JSchException, IOException {
-        sessionFactory = new DefaultSessionFactory( DEFAULT_USERNAME, DEFAULT_HOSTNAME, DEFAULT_PORT );
-        sessionFactory.setIdentitiesFromPrivateKeys( getPrivateKeys() );
-        sessionFactory.setKnownHosts( getKnownHosts() );
-
-        tunnelConnections = getTunnelConnections( sessionFactory );
+        sessionFactory = new DefaultSessionFactory();
+        setTunnelConnections();
     }
 
     @Override
@@ -62,61 +52,39 @@ public class Tunneler implements Closeable {
         }
     }
 
-    static String getKnownHosts() {
-        String knownHosts = System.getProperty( "ssh.known_hosts.file" );
-        if ( knownHosts != null && !knownHosts.isEmpty() ) {
-            return knownHosts;
-        }
-
-        File knownHostsFile = new File( DEFAULT_DOT_SSH, "known_hosts" );
-        if ( knownHostsFile.exists() ) {
-            return knownHostsFile.getAbsolutePath();
-        }
-
-        return null;
-    }
-
-    static List<String> getPrivateKeys() {
-        String identitiesString = System.getProperty( "ssh.identity.files" );
-        if ( identitiesString != null && !identitiesString.isEmpty() ) {
-            return Arrays.asList( identitiesString.split( "," ) );
-        }
-
-        List<String> identities = new ArrayList<String>();
-        for ( File file : new File[] {
-                new File( DEFAULT_DOT_SSH, "id_rsa" ),
-                new File( DEFAULT_DOT_SSH, "id_dsa" ),
-                new File( DEFAULT_DOT_SSH, "id_ecdsa" ) } ) {
-            if ( file.exists() ) {
-                identities.add( file.getAbsolutePath() );
+    private File dotJschDir() {
+        if ( dotJschDir == null ) {
+            String dotSshString = System.getProperty( PROPERTY_JSCH_DOT_JSCH );
+            if ( dotSshString != null ) {
+                dotJschDir = new File( dotSshString );
+            }
+            else {
+                dotJschDir = new File(
+                        new File( System.getProperty( "user.home" ) ),
+                        ".jsch" );
             }
         }
-        return identities;
+        return dotJschDir;
     }
 
-    static TunnelConnection getTunnelConnection( DefaultSessionFactory defaultSessionFactory, String tunnelSpec ) {
-        return null;
-    }
-
-    static List<TunnelConnection> getTunnelConnections( DefaultSessionFactory defaultSessionFactory ) throws IOException, JSchException {
+    private void setTunnelConnections() throws IOException, JSchException {
         File tunnels = null;
-        String tunnelsString = System.getProperty( "ssh.tunnels.file" );
+        String tunnelsString = System.getProperty( PROPERTY_JSCH_TUNNELS_FILE );
         if ( tunnelsString != null && !tunnelsString.isEmpty() ) {
             tunnels = new File( tunnelsString );
         }
         else {
-            File dotJsch = new File( DEFAULT_HOME, ".jsch" );
-            tunnels = new File( dotJsch, "tunnels.cfg" );
+            tunnels = new File( dotJschDir(), "tunnels.cfg" );
         }
 
         if ( !tunnels.exists() ) {
-            throw new FileNotFoundException( "tunnels.cfg not found.  must be at ~/.jsch/tunnels.cfg or specified as system property ssh.tunnels.file" );
+            throw new FileNotFoundException( "tunnels.cfg not found.  must be at ${user.home}/.jsch/tunnels.cfg or specified as system property ssh.tunnels.file" );
         }
 
         InputStream inputStream = null;
         try {
             inputStream = new FileInputStream( tunnels );
-            return getTunnelConnections( defaultSessionFactory, inputStream );
+            setTunnelConnections( inputStream );
         }
         finally {
             if ( inputStream != null ) {
@@ -125,13 +93,17 @@ public class Tunneler implements Closeable {
         }
     }
 
-    static List<TunnelConnection> getTunnelConnections( DefaultSessionFactory defaultSessionFactory, InputStream tunnels ) throws IOException, JSchException {
+    private void setTunnelConnections( InputStream tunnels ) throws IOException, JSchException {
         // A tunnelSpec looks like this:
         // user@host->tunnelUser@tunnelHost->tunnel2User@tunnel2Host|localAlias:localPort:destinationHostname:destinationPort
         Map<String, Set<Tunnel>> tunnelMap = new HashMap<String, Set<Tunnel>>();
         BufferedReader reader = new BufferedReader( new InputStreamReader( tunnels ) );
         String line = null;
         while ( (line = reader.readLine()) != null ) {
+            if ( PATTERN_TUNNELS_CFG_COMMENT_LINE.matcher( line ).matches() ) {
+                continue;
+            }
+
             String[] pathAndTunnel = line.split( "\\|" );
             Set<Tunnel> tunnelList = tunnelMap.get( pathAndTunnel[0] );
             if ( tunnelList == null ) {
@@ -141,14 +113,12 @@ public class Tunneler implements Closeable {
             tunnelList.add( new Tunnel( pathAndTunnel[1] ) );
         }
 
-        List<TunnelConnection> tunnelConnections = new ArrayList<TunnelConnection>();
-        SessionFactoryCache sessionFactoryCache = new SessionFactoryCache( defaultSessionFactory );
+        tunnelConnections = new ArrayList<TunnelConnection>();
+        SessionFactoryCache sessionFactoryCache = new SessionFactoryCache( sessionFactory );
         for ( String path : tunnelMap.keySet() ) {
             tunnelConnections.add( new TunnelConnection( sessionFactoryCache.getSessionFactory( path ),
                     new ArrayList<Tunnel>( tunnelMap.get( path ) ) ) );
         }
-
-        return tunnelConnections;
     }
 
     public void open() throws JSchException {
