@@ -42,6 +42,7 @@ public class Tunneler implements Closeable {
 
     public Tunneler() throws JSchException, IOException {
         sessionFactory = new DefaultSessionFactory();
+        sessionFactory.setConfig( "PreferredAuthentications", "publickey,keyboard-interactive,password" );
         setTunnelConnections();
     }
 
